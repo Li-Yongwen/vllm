@@ -91,6 +91,7 @@ class RoutedExpertsCapturer:
         self._shm: shared_memory.SharedMemory | None = None
         self._host_buffer_view: np.ndarray | None = None
         self._lock_file: str | None = None
+        self.compress_ratio: int = 1
 
     @classmethod
     def create(cls) -> RoutedExpertsCapturer:
@@ -112,6 +113,7 @@ class RoutedExpertsCapturer:
         max_num_batched_tokens: int,
         max_num_kv_tokens: int,
         vllm_config: VllmConfig,
+        compress_ratio: int = 1,
     ) -> None:
         """
         Initialize the device buffer and optionally shared memory buffer.
@@ -120,6 +122,7 @@ class RoutedExpertsCapturer:
             max_num_batched_tokens: Maximum number of tokens in a batch.
             max_num_kv_tokens: Maximum number of KV tokens for shared memory.
             vllm_config: vllm configuration containing layer and expert info.
+            compress_ratio: KV cache compression ratio for host buffer sizing.
         """
 
         if self._device_buffer is not None:
@@ -128,6 +131,7 @@ class RoutedExpertsCapturer:
         hf_config = vllm_config.model_config.hf_text_config
         num_layers = hf_config.num_hidden_layers
         num_experts_per_tok = hf_config.num_experts_per_tok
+        self.compress_ratio = compress_ratio
 
         # Initialize device buffer
         self._device_buffer = torch.zeros(
@@ -141,7 +145,8 @@ class RoutedExpertsCapturer:
             return
 
         # Initialize shared memory
-        shape = (max_num_kv_tokens, num_layers, num_experts_per_tok)
+        max_num_host_slots = max_num_kv_tokens * compress_ratio
+        shape = (max_num_host_slots, num_layers, num_experts_per_tok)
         buffer_size = int(np.prod(shape)) * np.dtype(np.int32).itemsize
         instance_id = vllm_config.instance_id
         self._lock_file = f"{_LOCK_FILE_PREFIX}_{instance_id}_{self.dp_rank}.lock"
@@ -154,9 +159,10 @@ class RoutedExpertsCapturer:
         self._host_buffer_view.fill(0)
 
         logger.debug(
-            "Created shared memory buffer '%s' with shape %s",
+            "Created shared memory buffer '%s' with shape %s, compress_ratio=%d",
             shm_name,
             shape,
+            compress_ratio,
         )
 
     def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
@@ -210,12 +216,21 @@ class RoutedExpertsCapturer:
         if self._device_buffer is not None:
             self._device_buffer.zero_()
 
-    def save_captured_experts(self, indices: np.ndarray) -> None:
+    def save_captured_experts(
+        self,
+        indices: np.ndarray,
+        token_positions: np.ndarray | None = None,
+    ) -> None:
         """
         Save captured experts from device buffer to shared memory.
 
         Args:
             indices: Array of indices indicating where to store the data.
+            token_positions: Original token positions within each request.
+                Required when compress_ratio > 1 to expand indices to
+                per-token granularity.
+                TODO: Implement host_index computation when compress_ratio > 1:
+                host_index = kv_slot * compress_ratio + (token_position % compress_ratio)
         """
         if get_tensor_model_parallel_rank() != 0:
             return
@@ -284,6 +299,7 @@ class RoutedExpertsReader:
         self,
         max_num_kv_tokens: int,
         vllm_config: VllmConfig,
+        compress_ratio: int = 1,
     ) -> None:
         """
         Attach to an existing shared memory buffer.
@@ -291,14 +307,17 @@ class RoutedExpertsReader:
         Args:
             max_num_kv_tokens: Maximum number of KV tokens.
             vllm_config: vllm configuration.
+            compress_ratio: KV cache compression ratio for host buffer sizing.
         """
         if self._shm is not None:
             logger.warning("Already attached to shared memory buffer.")
             return  # Already attached
 
+        self.compress_ratio = compress_ratio
         hf_config = vllm_config.model_config.hf_text_config
+        max_num_host_slots = max_num_kv_tokens * self.compress_ratio
         shape = (
-            max_num_kv_tokens,
+            max_num_host_slots,
             hf_config.num_hidden_layers,
             hf_config.num_experts_per_tok,
         )
