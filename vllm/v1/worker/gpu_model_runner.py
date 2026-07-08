@@ -6877,26 +6877,25 @@ class GPUModelRunner(
         )
         routed_experts_capturer = RoutedExpertsCapturer.create()
         self.routed_experts_attn_gid = self._get_attention_kv_cache_gid()
-        attn_block_size = self.kv_cache_config.kv_cache_groups[
-            self.routed_experts_attn_gid
-        ].kv_cache_spec.block_size
-        self.max_num_kv_tokens = (
-            self.kv_cache_config.num_blocks * attn_block_size
+        min_block_size = min(
+            [
+                group.kv_cache_spec.block_size
+                for group in self.kv_cache_config.kv_cache_groups
+            ]
         )
+        num_groups = len(self.kv_cache_config.kv_cache_groups)
+        self.max_num_kv_tokens = (
+            self.kv_cache_config.num_blocks // num_groups
+        ) * min_block_size
         dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
         pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
         if pcp_size * dcp_size > 1:
             self.max_num_kv_tokens *= pcp_size * dcp_size
 
-        attn_compress_ratio = getattr(
-            self.kv_cache_config.kv_cache_groups[self.routed_experts_attn_gid].kv_cache_spec,
-            'compress_ratio', 1)
-
         routed_experts_capturer.init_buffer(
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             max_num_kv_tokens=self.max_num_kv_tokens,
             vllm_config=self.vllm_config,
-            compress_ratio=attn_compress_ratio,
         )
         self._bind_routed_experts_capturer(routed_experts_capturer)
         self.routed_experts_initialized = True

@@ -277,25 +277,24 @@ class Scheduler(SchedulerInterface):
                 if isinstance(group.kv_cache_spec, AttentionSpec):
                     self.routed_experts_attn_gid = gid
                     break
-            attn_block_size = kv_cache_config.kv_cache_groups[
-                self.routed_experts_attn_gid
-            ].kv_cache_spec.block_size
-            self.max_num_kv_tokens = (
-                kv_cache_config.num_blocks * attn_block_size
+            min_block_size = min(
+                [
+                    group.kv_cache_spec.block_size
+                    for group in kv_cache_config.kv_cache_groups
+                ]
             )
+            num_groups = len(kv_cache_config.kv_cache_groups)
+            self.max_num_kv_tokens = (
+                kv_cache_config.num_blocks // num_groups
+            ) * min_block_size
             dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
             pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
             if pcp_size * dcp_size > 1:
                 self.max_num_kv_tokens *= pcp_size * dcp_size
 
-            attn_compress_ratio = getattr(
-                kv_cache_config.kv_cache_groups[self.routed_experts_attn_gid].kv_cache_spec,
-                'compress_ratio', 1)
-
             self.routed_experts_reader.attach_buffer(
                 max_num_kv_tokens=self.max_num_kv_tokens,
                 vllm_config=self.vllm_config,
-                compress_ratio=attn_compress_ratio,
             )
 
         self._pause_state: PauseState = PauseState.UNPAUSED
@@ -1621,25 +1620,16 @@ class Scheduler(SchedulerInterface):
         num_blocks = len(block_ids)
         attn_group = self.kv_cache_config.kv_cache_groups[self.routed_experts_attn_gid]
         block_size = attn_group.kv_cache_spec.block_size
-        compress_ratio = getattr(attn_group.kv_cache_spec, 'compress_ratio', 1)
 
-        if compress_ratio > 1:
-            # With compressed KV cache, compute per-token host indices.
-            # TODO: Replace magic number 4 with a named constant or
-            # derive from kv_cache_spec attributes.
-            _PHYSICAL_BLOCK_MULTIPLIER = 4
-            token_positions = np.arange(num_tokens)
-            block_indices = token_positions // (block_size * _PHYSICAL_BLOCK_MULTIPLIER)
-            offsets = token_positions % (block_size * _PHYSICAL_BLOCK_MULTIPLIER)
-            kv_slots = block_ids_array[block_indices] * (block_size * _PHYSICAL_BLOCK_MULTIPLIER) + offsets
-            slot_mapping = kv_slots
-        else:
-            # Original logic: one kv slot per token.
-            block_offsets = np.arange(0, block_size)
-            slot_mapping = (
-                block_offsets.reshape((1, block_size))
-                + block_ids_array.reshape((num_blocks, 1)) * block_size
-            ).flatten()[:num_tokens]
+        # generate block offsets
+        block_offsets = np.arange(0, block_size)
+
+        # compute slot mapping: slot = block_id * block_size + offset
+        slot_mapping = (
+            block_offsets.reshape((1, block_size))
+            + block_ids_array.reshape((num_blocks, 1)) * block_size
+        ).flatten()[:num_tokens]
+
         return self.routed_experts_reader.get_routed_experts(indices=slot_mapping)
 
     def _update_request_with_output(
