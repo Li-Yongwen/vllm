@@ -34,6 +34,28 @@ _global_experts_capturer: RoutedExpertsCapturer | None = None
 _global_experts_reader: RoutedExpertsReader | None = None
 
 
+def _get_compress_ratio(kv_cache_spec) -> int:
+    """Extract compress_ratio from a kv_cache_spec.
+
+    The scheduler receives individual specs (e.g. AttentionSpec) after
+    ``generate_scheduler_kv_cache_config`` flattens
+    ``UniformTypeKVCacheSpecs``.  Workers, however, still hold the
+    ``UniformTypeKVCacheSpecs`` wrapper which does **not** expose
+    ``compress_ratio`` directly.  In that case we look it up from the
+    first inner spec.
+    """
+    cr = getattr(kv_cache_spec, "compress_ratio", None)
+    if cr is not None:
+        return cr
+    # kv_cache_spec may be UniformTypeKVCacheSpecs (worker side)
+    inner = getattr(kv_cache_spec, "kv_cache_specs", None)
+    if inner:
+        first_spec = next(iter(inner.values()), None)
+        if first_spec is not None:
+            return getattr(first_spec, "compress_ratio", 1)
+    return 1
+
+
 @contextmanager
 def _file_lock(lock_file: str, mode: str = "wb+") -> Generator[None, None, None]:
     """Context manager for file-based locking."""

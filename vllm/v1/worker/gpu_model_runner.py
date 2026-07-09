@@ -55,6 +55,7 @@ from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    _get_compress_ratio,
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
@@ -6889,9 +6890,8 @@ class GPUModelRunner(
         if pcp_size * dcp_size > 1:
             self.max_num_kv_tokens *= pcp_size * dcp_size
 
-        attn_compress_ratio = getattr(
-            self.kv_cache_config.kv_cache_groups[self.routed_experts_attn_gid].kv_cache_spec,
-            'compress_ratio', 1)
+        attn_compress_ratio = _get_compress_ratio(
+            self.kv_cache_config.kv_cache_groups[self.routed_experts_attn_gid].kv_cache_spec)
 
         routed_experts_capturer.init_buffer(
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,

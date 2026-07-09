@@ -29,6 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStat
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsReader,
+    _get_compress_ratio,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
@@ -289,9 +290,8 @@ class Scheduler(SchedulerInterface):
             if pcp_size * dcp_size > 1:
                 self.max_num_kv_tokens *= pcp_size * dcp_size
 
-            attn_compress_ratio = getattr(
-                kv_cache_config.kv_cache_groups[self.routed_experts_attn_gid].kv_cache_spec,
-                'compress_ratio', 1)
+            attn_compress_ratio = _get_compress_ratio(
+                kv_cache_config.kv_cache_groups[self.routed_experts_attn_gid].kv_cache_spec)
 
             self.routed_experts_reader.attach_buffer(
                 max_num_kv_tokens=self.max_num_kv_tokens,
@@ -1622,7 +1622,7 @@ class Scheduler(SchedulerInterface):
         num_blocks = len(block_ids)
         attn_group = self.kv_cache_config.kv_cache_groups[self.routed_experts_attn_gid]
         block_size = attn_group.kv_cache_spec.block_size
-        compress_ratio = getattr(attn_group.kv_cache_spec, 'compress_ratio', 1)
+        compress_ratio = _get_compress_ratio(attn_group.kv_cache_spec)
 
         if compress_ratio > 1:
             # With compressed KV cache, compute per-token host indices.
