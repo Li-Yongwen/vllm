@@ -273,6 +273,16 @@ class RoutedExpertsCapturer:
         valid_indices = host_indices[valid_mask]
         valid_data = data[valid_mask]
 
+        logger.info(
+            "[routed_experts] save: num_tokens=%d valid=%d "
+            "indices[:3]=%s host_indices[:3]=%s data_nonzero=%s "
+            "compress_ratio=%s host_buf_shape=%s",
+            num_tokens, len(valid_indices),
+            indices[:3], valid_indices[:3], (valid_data != 0).any(),
+            getattr(self, 'compress_ratio', 'N/A'),
+            self._host_buffer_view.shape if self._host_buffer_view is not None else None,
+        )
+
         with _file_lock(self._lock_file):
             self._host_buffer_view[valid_indices, :, :] = valid_data
 
@@ -385,6 +395,14 @@ class RoutedExpertsReader:
 
         with _file_lock(self._lock_file, mode="rb+"):
             result = self._host_buffer_view[indices, :, :].copy()
+
+        logger.info(
+            "[routed_experts] read: indices[:3]=%s result_nonzero=%s "
+            "host_buf_shape=%s host_buf_any_nonzero=%s",
+            indices[:3], (result != 0).any(),
+            self._host_buffer_view.shape,
+            (self._host_buffer_view != 0).any(),
+        )
 
         return result
 
