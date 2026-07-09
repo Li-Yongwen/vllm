@@ -259,16 +259,6 @@ class RoutedExpertsCapturer:
         num_tokens = len(indices)
         data = self._device_buffer[:num_tokens, :, :].cpu().numpy()
 
-        # DEBUG: log save stats
-        logger.info(
-            "[DEBUG save] num_tokens=%d indices[:5]=%s data_nonzero=%s "
-            "data[:2,0,:]=%s compress_ratio=%s host_buf_shape=%s",
-            num_tokens, indices[:5],
-            (data != 0).any(), data[:2, 0, :],
-            getattr(self, 'compress_ratio', 'N/A'),
-            self._host_buffer_view.shape if self._host_buffer_view is not None else None,
-        )
-
         # Expand kv_slot indices to per-token host indices.
         # host_index = kv_slot * compress_ratio + (token_position % compress_ratio)
         # if self.compress_ratio > 1 and token_positions is not None:
@@ -278,8 +268,13 @@ class RoutedExpertsCapturer:
         #     host_indices = indices
         host_indices = indices
 
+        # Skip slots with -1 (padding tokens that have no KV cache slot).
+        valid_mask = host_indices >= 0
+        valid_indices = host_indices[valid_mask]
+        valid_data = data[valid_mask]
+
         with _file_lock(self._lock_file):
-            self._host_buffer_view[host_indices, :, :] = data
+            self._host_buffer_view[valid_indices, :, :] = valid_data
 
     def cleanup(self) -> None:
         """Explicitly clean up shared memory resources."""
@@ -390,15 +385,6 @@ class RoutedExpertsReader:
 
         with _file_lock(self._lock_file, mode="rb+"):
             result = self._host_buffer_view[indices, :, :].copy()
-
-        # DEBUG: log read stats
-        logger.info(
-            "[DEBUG read] indices[:5]=%s result_nonzero=%s result[:2,0,:]=%s "
-            "host_buf_shape=%s host_buf_nonzero=%s",
-            indices[:5], (result != 0).any(), result[:2, 0, :],
-            self._host_buffer_view.shape,
-            (self._host_buffer_view != 0).any(),
-        )
 
         return result
 
