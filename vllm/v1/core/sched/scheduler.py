@@ -1617,6 +1617,13 @@ class Scheduler(SchedulerInterface):
         block_ids = kv_blocks.get_block_ids()[self.routed_experts_attn_gid]
         num_tokens = request.num_tokens - 1
 
+        logger.info(
+            "[DEBUG _get_routed_experts] request=%s num_tokens=%d "
+            "num_blocks=%d block_ids[:5]=%s attn_gid=%s",
+            request.request_id, num_tokens, len(block_ids),
+            block_ids[:5], self.routed_experts_attn_gid,
+        )
+
         # compute slot mapping using attention group's block_size
         block_ids_array = np.array(block_ids, dtype=np.int32)
         num_blocks = len(block_ids)
@@ -1638,6 +1645,13 @@ class Scheduler(SchedulerInterface):
                 block_offsets.reshape((1, block_size))
                 + block_ids_array.reshape((num_blocks, 1)) * block_size
             ).flatten()[:num_tokens]
+
+        logger.info(
+            "[DEBUG _get_routed_experts] slot_mapping[:5]=%s "
+            "slot_mapping_max=%d compress_ratio=%d block_size=%d",
+            slot_mapping[:5], slot_mapping.max(), compress_ratio, block_size,
+        )
+
         return self.routed_experts_reader.get_routed_experts(indices=slot_mapping)
 
     def _update_request_with_output(
