@@ -1638,7 +1638,7 @@ class Scheduler(SchedulerInterface):
 
         result = self.routed_experts_reader.get_routed_experts(indices=slot_mapping)
         print(f"[SCHED routed_experts] slot_mapping[:3]={slot_mapping[:3]} "
-              f"compress_ratio={compress_ratio} result_nonzero={(result != 0).any()} "
+              f"result_nonzero={(result != 0).any()} "
               f"result_shape={result.shape}", file=sys.stderr, flush=True)
         return result
 
