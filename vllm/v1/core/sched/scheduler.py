@@ -280,9 +280,10 @@ class Scheduler(SchedulerInterface):
             attn_block_size = kv_cache_config.kv_cache_groups[
                 self.routed_experts_attn_gid
             ].kv_cache_spec.block_size
+            num_groups = len(kv_cache_config.kv_cache_groups)
             self.max_num_kv_tokens = (
-                kv_cache_config.num_blocks * attn_block_size
-            )
+                kv_cache_config.num_blocks // num_groups
+            ) * attn_block_size
             dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
             pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
             if pcp_size * dcp_size > 1:
