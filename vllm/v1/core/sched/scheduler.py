@@ -1626,22 +1626,15 @@ class Scheduler(SchedulerInterface):
         num_blocks = len(block_ids)
         attn_group = self.kv_cache_config.kv_cache_groups[self.routed_experts_attn_gid]
         block_size = attn_group.kv_cache_spec.block_size
-        compress_ratio = _get_compress_ratio(attn_group.kv_cache_spec)
 
-        if compress_ratio > 1:
-            # With compressed KV cache, compute per-token host indices.
-            token_positions = np.arange(num_tokens)
-            block_indices = token_positions // (block_size * 4)
-            offsets = token_positions % (block_size * 4)
-            kv_slots = block_ids_array[block_indices] * (block_size * 4) + offsets
-            slot_mapping = kv_slots
-        else:
-            # Original logic: one kv slot per token.
-            block_offsets = np.arange(0, block_size)
-            slot_mapping = (
-                block_offsets.reshape((1, block_size))
-                + block_ids_array.reshape((num_blocks, 1)) * block_size
-            ).flatten()[:num_tokens]
+        # Always use the same KV-slot-based indexing that the worker uses.
+        # The host buffer is laid out as (max_num_kv_tokens * compress_ratio, layers, topk)
+        # and the worker writes at the KV slot position directly.
+        block_offsets = np.arange(0, block_size)
+        slot_mapping = (
+            block_offsets.reshape((1, block_size))
+            + block_ids_array.reshape((num_blocks, 1)) * block_size
+        ).flatten()[:num_tokens]
 
         result = self.routed_experts_reader.get_routed_experts(indices=slot_mapping)
         print(f"[SCHED routed_experts] slot_mapping[:3]={slot_mapping[:3]} "
