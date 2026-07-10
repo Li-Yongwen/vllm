@@ -1622,58 +1622,15 @@ class Scheduler(SchedulerInterface):
 
         reader = self.routed_experts_reader
 
-        # Try to read from shared memory using the slot_mapping written
-        # by the worker.  The worker stores slot_mapping and token_counts
-        # per request in shared memory alongside the data.
-        # We need to find this request's token offset in the slot_mapping.
-        if (reader._slot_mapping_views
-                and reader._token_counts_views
-                and hasattr(self, '_routed_experts_req_idx')):
-            sm_view = reader._slot_mapping_views[0]
-            tc_view = reader._token_counts_views[0]
-            buf_view = reader._host_buffer_views[0]
-            lock_file = reader._lock_files[0]
-
-            req_idx = self._routed_experts_req_idx
-            num_reqs = getattr(self, '_routed_experts_num_reqs', 0)
-            if req_idx < num_reqs:
-                with _file_lock(lock_file, mode="rb+"):
-                    token_counts = tc_view[:num_reqs].copy()
-                    token_offset = int(token_counts[:req_idx].sum())
-                    token_count = int(token_counts[req_idx])
-
-                if token_count > 0:
-                    with _file_lock(lock_file, mode="rb+"):
-                        slot_indices = sm_view[token_offset:token_offset + token_count].copy()
-
-                    # Read data using worker's slot indices
-                    valid_mask = slot_indices >= 0
-                    valid_slots = slot_indices[valid_mask]
-
-                    result = np.zeros(
-                        (token_count, buf_view.shape[1], buf_view.shape[2]),
-                        dtype=np.int32,
-                    )
-
-                    if len(valid_slots) > 0:
-                        with _file_lock(lock_file, mode="rb+"):
-                            valid_data = buf_view[valid_slots, :, :].copy()
-                        result[valid_mask] = valid_data
-
-                    return result
-
-        # Fallback: compute slot indices from block_ids
-        import sys
-        print(f"[FALLBACK] req={request.request_id} num_tokens={num_tokens} "
-              f"num_all_tokens={request.num_tokens}", file=sys.stderr, flush=True)
+        # Compute slot indices from block_ids (the worker writes data
+        # to these slots during every forward pass, so the shared memory
+        # buffer contains the routed-expert data for all historical tokens).
         kv_blocks = self.kv_cache_manager.get_blocks(request.request_id)
         block_ids = kv_blocks.get_block_ids()[self.routed_experts_attn_gid]
         block_ids_array = np.array(block_ids, dtype=np.int32)
         num_blocks = len(block_ids)
         attn_group = self.kv_cache_config.kv_cache_groups[self.routed_experts_attn_gid]
         block_size = attn_group.kv_cache_spec.block_size
-        print(f"[FALLBACK] num_blocks={num_blocks} block_ids[:3]={block_ids_array[:3].tolist()} "
-              f"block_size={block_size}", file=sys.stderr, flush=True)
 
         block_offsets = np.arange(0, block_size)
         slot_mapping = (
