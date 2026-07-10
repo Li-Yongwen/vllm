@@ -1622,19 +1622,14 @@ class Scheduler(SchedulerInterface):
         num_blocks = len(block_ids)
         attn_group = self.kv_cache_config.kv_cache_groups[self.routed_experts_attn_gid]
         block_size = attn_group.kv_cache_spec.block_size
-        compress_ratio = _get_compress_ratio(attn_group.kv_cache_spec)
 
-        # Always use the same KV-slot-based indexing that the worker uses.
-        # The host buffer is laid out as (max_num_kv_slots, layers, topk)
-        # and the worker writes at the KV slot position directly.
-        # In compress mode, each block covers block_size * compress_ratio
-        # logical positions, so the slot stride per block is
-        # block_size * compress_ratio.
-        block_offsets = np.arange(0, block_size * compress_ratio)
+        # Use the same slot indexing that the worker writes to shared memory.
+        # The worker uses slot_mapping from the block table which is:
+        #   block_id * block_size + offset_within_block
+        block_offsets = np.arange(0, block_size)
         slot_mapping = (
-            block_offsets.reshape((1, block_size * compress_ratio))
-            + block_ids_array.reshape((num_blocks, 1))
-            * block_size * compress_ratio
+            block_offsets.reshape((1, block_size))
+            + block_ids_array.reshape((num_blocks, 1)) * block_size
         ).flatten()[:num_tokens]
 
         return self.routed_experts_reader.get_routed_experts(indices=slot_mapping)
