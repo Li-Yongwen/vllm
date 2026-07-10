@@ -1617,10 +1617,6 @@ class Scheduler(SchedulerInterface):
         block_ids = kv_blocks.get_block_ids()[self.routed_experts_attn_gid]
         num_tokens = request.num_tokens - 1
 
-        import sys
-        print(f"[SCHED routed_experts] req={request.request_id} num_tokens={num_tokens} "
-              f"num_blocks={len(block_ids)} block_ids[:3]={block_ids[:3]}", file=sys.stderr, flush=True)
-
         # compute slot mapping using attention group's block_size
         block_ids_array = np.array(block_ids, dtype=np.int32)
         num_blocks = len(block_ids)
@@ -1636,11 +1632,7 @@ class Scheduler(SchedulerInterface):
             + block_ids_array.reshape((num_blocks, 1)) * block_size
         ).flatten()[:num_tokens]
 
-        result = self.routed_experts_reader.get_routed_experts(indices=slot_mapping)
-        print(f"[SCHED routed_experts] slot_mapping[:3]={slot_mapping[:3]} "
-              f"result_nonzero={(result != 0).any()} "
-              f"result_shape={result.shape}", file=sys.stderr, flush=True)
-        return result
+        return self.routed_experts_reader.get_routed_experts(indices=slot_mapping)
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]

@@ -273,7 +273,7 @@ class RoutedExpertsCapturer:
         valid_indices = host_indices[valid_mask]
         valid_data = data[valid_mask]
 
-        logger.info(
+        logger.debug(
             "[routed_experts] save: num_tokens=%d valid=%d "
             "indices[:3]=%s host_indices[:3]=%s data_nonzero=%s "
             "compress_ratio=%s host_buf_shape=%s",
@@ -308,14 +308,21 @@ class RoutedExpertsReader:
 
     This class attaches to shared memory created by RoutedExpertsCapturer
     and reads expert routing decisions.
+
+    In expert-parallel (EP) setups, each EP rank writes to its own shared
+    memory segment. The reader attaches to *all* EP ranks and merges
+    results so that every token's routing data is available regardless of
+    which EP rank processed it.
     """
 
     _instance: RoutedExpertsReader | None = None
 
     def __init__(self) -> None:
-        self._shm: shared_memory.SharedMemory | None = None
-        self._host_buffer_view: np.ndarray | None = None
-        self._lock_file: str | None = None
+        # Per EP-rank lists (index = dp_rank / ep_rank)
+        self._shms: list[shared_memory.SharedMemory] = []
+        self._host_buffer_views: list[np.ndarray] = []
+        self._lock_files: list[str] = []
+        self._dp_size: int = 1
 
     @classmethod
     def create(cls) -> RoutedExpertsReader:
@@ -341,14 +348,17 @@ class RoutedExpertsReader:
         compress_ratio: int = 1,
     ) -> None:
         """
-        Attach to an existing shared memory buffer.
+        Attach to shared memory buffer(s).
+
+        In EP setups, attaches to all EP ranks' buffers so that routing
+        data is available for every token.
 
         Args:
             max_num_kv_tokens: Maximum number of KV tokens.
             vllm_config: vllm configuration.
             compress_ratio: Compression ratio for KV cache (default: 1).
         """
-        if self._shm is not None:
+        if self._shms:
             logger.warning("Already attached to shared memory buffer.")
             return  # Already attached
 
@@ -361,26 +371,58 @@ class RoutedExpertsReader:
             hf_config.num_experts_per_tok,
         )
 
-        self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        dp_size = vllm_config.parallel_config.data_parallel_size
+        self._dp_size = dp_size
         instance_id = vllm_config.instance_id
-        self._lock_file = f"{_LOCK_FILE_PREFIX}_{instance_id}_{self.dp_rank}.lock"
-        shm_name = f"{_BUFFER_PREFIX}_{instance_id}_{self.dp_rank}"
 
-        with _file_lock(self._lock_file, mode="rb+"):
-            # Avoid resource_tracker registering the shared memory
-            with patch(
-                "multiprocessing.resource_tracker.register",
-                lambda *args, **kwargs: None,
-            ):
-                self._shm = shared_memory.SharedMemory(name=shm_name)
+        for dp_rank in range(dp_size):
+            lock_file = f"{_LOCK_FILE_PREFIX}_{instance_id}_{dp_rank}.lock"
+            shm_name = f"{_BUFFER_PREFIX}_{instance_id}_{dp_rank}"
 
-            self._host_buffer_view = np.ndarray(
-                shape, dtype=np.int32, buffer=self._shm.buf
+            # The scheduler may start before all EP workers have created
+            # their shared memory.  Retry with a short delay.
+            shm = None
+            for attempt in range(60):  # up to ~30 s
+                try:
+                    with _file_lock(lock_file, mode="rb+"):
+                        with patch(
+                            "multiprocessing.resource_tracker.register",
+                            lambda *args, **kwargs: None,
+                        ):
+                            shm = shared_memory.SharedMemory(name=shm_name)
+                    break
+                except FileNotFoundError:
+                    import time
+                    time.sleep(0.5)
+            if shm is None:
+                logger.warning(
+                    "RoutedExpertsReader: could not attach to EP rank %d "
+                    "shared memory '%s' after 30 s; skipping.",
+                    dp_rank, shm_name,
+                )
+                continue
+
+            buf_view = np.ndarray(
+                shape, dtype=np.int32, buffer=shm.buf
             )
+
+            self._shms.append(shm)
+            self._host_buffer_views.append(buf_view)
+            self._lock_files.append(lock_file)
+
+        logger.info(
+            "RoutedExpertsReader attached to %d EP rank buffer(s), "
+            "shape=%s compress_ratio=%s",
+            dp_size, shape, compress_ratio,
+        )
 
     def get_routed_experts(self, indices: np.ndarray) -> np.ndarray:
         """
         Read routed expert data from shared memory.
+
+        In EP setups, reads from all EP ranks' buffers and merges them
+        so that each token gets the routing data from whichever rank
+        wrote to its slot.
 
         Args:
             indices: Array of indices to read.
@@ -388,33 +430,48 @@ class RoutedExpertsReader:
         Returns:
             Copy of the expert routing data for the given indices.
         """
-        if self._host_buffer_view is None:
+        if not self._host_buffer_views:
             raise RuntimeError("Buffer not attached. Call attach_buffer() first.")
-        if self._lock_file is None:
-            raise RuntimeError("Lock file not initialized.")
 
-        with _file_lock(self._lock_file, mode="rb+"):
-            result = self._host_buffer_view[indices, :, :].copy()
+        # Read from all EP rank buffers and merge.
+        # Each EP rank writes to its own slot positions; zeros indicate
+        # "no data at this slot from this rank".  We merge by picking
+        # the first non-zero entry across ranks.
+        result: np.ndarray | None = None
+        for dp_rank, (buf_view, lock_file) in enumerate(
+            zip(self._host_buffer_views, self._lock_files)
+        ):
+            with _file_lock(lock_file, mode="rb+"):
+                chunk = buf_view[indices, :, :].copy()
+            if dp_rank == 0:
+                result = chunk
+            else:
+                # Merge: where result is zero, take chunk's value.
+                zero_mask = result == 0
+                result[zero_mask] = chunk[zero_mask]
 
-        logger.info(
+        assert result is not None
+
+        logger.debug(
             "[routed_experts] read: indices[:3]=%s result_nonzero=%s "
-            "host_buf_shape=%s host_buf_any_nonzero=%s",
+            "host_buf_shape=%s dp_size=%s",
             indices[:3], (result != 0).any(),
-            self._host_buffer_view.shape,
-            (self._host_buffer_view != 0).any(),
+            self._host_buffer_views[0].shape if self._host_buffer_views else None,
+            self._dp_size,
         )
 
         return result
 
     def cleanup(self) -> None:
         """Explicitly clean up resources (close without unlink)."""
-        if self._shm is not None:
+        for shm in self._shms:
             try:
-                self._shm.close()
+                shm.close()
             except Exception:
                 logger.debug("Exception during cleanup for reader", exc_info=True)
-            finally:
-                self._shm = None
+        self._shms.clear()
+        self._host_buffer_views.clear()
+        self._lock_files.clear()
 
     def __del__(self) -> None:
         """Close shared memory on destruction (do not unlink)."""
