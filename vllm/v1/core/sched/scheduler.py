@@ -12,6 +12,7 @@ import numpy as np
 from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import _file_lock
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorMetadata,
     ECConnectorRole,
@@ -1345,7 +1346,7 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
-        for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
+        for req_iter_idx, (req_id, num_tokens_scheduled) in enumerate(num_scheduled_tokens.items()):
             assert num_tokens_scheduled > 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
@@ -1433,6 +1434,8 @@ class Scheduler(SchedulerInterface):
             routed_experts = None
             finish_reason = None
             if stopped:
+                self._routed_experts_req_idx = req_iter_idx
+                self._routed_experts_num_reqs = len(num_scheduled_tokens)
                 routed_experts = self._get_routed_experts(request)
 
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
@@ -1619,26 +1622,53 @@ class Scheduler(SchedulerInterface):
 
         reader = self.routed_experts_reader
 
-        # Compute slot mapping using the same block_size that the worker
-        # uses.  The worker writes metadata (block_table.block_size and
-        # physical_block_size) into shared memory so the scheduler can
-        # compute correct KV slot indices.
+        # Try to read from shared memory using the slot_mapping written
+        # by the worker.  The worker stores slot_mapping and token_counts
+        # per request in shared memory alongside the data.
+        # We need to find this request's token offset in the slot_mapping.
+        if (reader._slot_mapping_views
+                and reader._token_counts_views
+                and hasattr(self, '_routed_experts_req_idx')):
+            sm_view = reader._slot_mapping_views[0]
+            tc_view = reader._token_counts_views[0]
+            buf_view = reader._host_buffer_views[0]
+            lock_file = reader._lock_files[0]
+
+            req_idx = self._routed_experts_req_idx
+            num_reqs = getattr(self, '_routed_experts_num_reqs', 0)
+            if req_idx < num_reqs:
+                with _file_lock(lock_file, mode="rb+"):
+                    token_counts = tc_view[:num_reqs].copy()
+                    token_offset = int(token_counts[:req_idx].sum())
+                    token_count = int(token_counts[req_idx])
+
+                if token_count > 0:
+                    with _file_lock(lock_file, mode="rb+"):
+                        slot_indices = sm_view[token_offset:token_offset + token_count].copy()
+
+                    # Read data using worker's slot indices
+                    valid_mask = slot_indices >= 0
+                    valid_slots = slot_indices[valid_mask]
+
+                    result = np.zeros(
+                        (token_count, buf_view.shape[1], buf_view.shape[2]),
+                        dtype=np.int32,
+                    )
+
+                    if len(valid_slots) > 0:
+                        with _file_lock(lock_file, mode="rb+"):
+                            valid_data = buf_view[valid_slots, :, :].copy()
+                        result[valid_mask] = valid_data
+
+                    return result
+
+        # Fallback: compute slot indices from block_ids
         kv_blocks = self.kv_cache_manager.get_blocks(request.request_id)
         block_ids = kv_blocks.get_block_ids()[self.routed_experts_attn_gid]
         block_ids_array = np.array(block_ids, dtype=np.int32)
         num_blocks = len(block_ids)
         attn_group = self.kv_cache_config.kv_cache_groups[self.routed_experts_attn_gid]
-
-        # Read block_size from shared memory metadata (written by worker).
-        # Fall back to kv_cache_spec.block_size if metadata is unavailable.
         block_size = attn_group.kv_cache_spec.block_size
-        if reader._metadata_views:
-            meta_view = reader._metadata_views[0]
-            lock_file = reader._lock_files[0]
-            with _file_lock(lock_file, mode="rb+"):
-                worker_block_size = int(meta_view[0])
-            if worker_block_size > 0:
-                block_size = worker_block_size
 
         block_offsets = np.arange(0, block_size)
         slot_mapping = (
