@@ -1613,35 +1613,40 @@ class Scheduler(SchedulerInterface):
         if not self.vllm_config.model_config.enable_return_routed_experts:
             return None
 
+        num_tokens = request.num_tokens - 1
+        if num_tokens <= 0:
+            return None
+
+        reader = self.routed_experts_reader
+
+        # Compute slot mapping using the same block_size that the worker
+        # uses.  The worker writes metadata (block_table.block_size and
+        # physical_block_size) into shared memory so the scheduler can
+        # compute correct KV slot indices.
         kv_blocks = self.kv_cache_manager.get_blocks(request.request_id)
         block_ids = kv_blocks.get_block_ids()[self.routed_experts_attn_gid]
-        num_tokens = request.num_tokens - 1
-
-        # compute slot mapping using attention group's block_size
         block_ids_array = np.array(block_ids, dtype=np.int32)
         num_blocks = len(block_ids)
         attn_group = self.kv_cache_config.kv_cache_groups[self.routed_experts_attn_gid]
-        block_size = attn_group.kv_cache_spec.block_size
 
-        # Use the same slot indexing that the worker writes to shared memory.
-        # The worker computes: slot = block_id * block_size + offset_within_block
+        # Read block_size from shared memory metadata (written by worker).
+        # Fall back to kv_cache_spec.block_size if metadata is unavailable.
+        block_size = attn_group.kv_cache_spec.block_size
+        if reader._metadata_views:
+            meta_view = reader._metadata_views[0]
+            lock_file = reader._lock_files[0]
+            with _file_lock(lock_file, mode="rb+"):
+                worker_block_size = int(meta_view[0])
+            if worker_block_size > 0:
+                block_size = worker_block_size
+
         block_offsets = np.arange(0, block_size)
         slot_mapping = (
             block_offsets.reshape((1, block_size))
             + block_ids_array.reshape((num_blocks, 1)) * block_size
         ).flatten()[:num_tokens]
 
-        result = self.routed_experts_reader.get_routed_experts(indices=slot_mapping)
-
-        import sys
-        is_zero = result is not None and result.max() == 0
-        if is_zero and num_tokens > 0:
-            print(f"[SCHED-ZERO] req={request.request_id} num_tokens={num_tokens} "
-                  f"block_ids[:3]={block_ids[:3]} block_size={block_size} "
-                  f"slot_mapping[:3]={slot_mapping[:3]}",
-                  file=sys.stderr, flush=True)
-
-        return result
+        return reader.get_routed_experts(indices=slot_mapping)
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]

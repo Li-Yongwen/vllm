@@ -141,6 +141,7 @@ class RoutedExpertsCapturer:
         max_num_kv_tokens: int,
         vllm_config: VllmConfig,
         compress_ratio: int = 1,
+        max_num_reqs: int = 0,
     ) -> None:
         """
         Initialize the device buffer and optionally shared memory buffer.
@@ -174,7 +175,18 @@ class RoutedExpertsCapturer:
         # Initialize shared memory
         max_num_host_slots = max_num_kv_tokens * compress_ratio
         shape = (max_num_host_slots, num_layers, num_experts_per_tok)
-        buffer_size = int(np.prod(shape)) * np.dtype(np.int32).itemsize
+        # Shared memory layout:
+        # [0, 2): metadata (block_table.block_size, block_table.physical_block_size)
+        # [2, 2 + data_elems): routed_experts data
+        # [2 + data_elems, 2 + data_elems + sm_elems): slot_mapping
+        # [2 + data_elems + sm_elems, ...): token_counts_per_req
+        elem_size = np.dtype(np.int32).itemsize
+        meta_elems = 2
+        data_elems = max_num_host_slots * num_layers * num_experts_per_tok
+        sm_elems = max_num_batched_tokens
+        tc_elems = max_num_reqs
+        total_elems = meta_elems + data_elems + sm_elems + tc_elems
+        buffer_size = total_elems * elem_size
         instance_id = vllm_config.instance_id
         self._lock_file = f"{_LOCK_FILE_PREFIX}_{instance_id}_{self.dp_rank}.lock"
         shm_name = f"{_BUFFER_PREFIX}_{instance_id}_{self.dp_rank}"
@@ -182,9 +194,19 @@ class RoutedExpertsCapturer:
         self._shm, newly_created = _create_or_attach_shared_memory(
             shm_name, buffer_size, self._lock_file
         )
-        self._host_buffer_view = np.ndarray(shape, dtype=np.int32, buffer=self._shm.buf)
+        buf = np.ndarray((total_elems,), dtype=np.int32, buffer=self._shm.buf)
+        # Metadata: [0] = block_table.block_size, [1] = physical_block_size
+        self._metadata_view = buf[:meta_elems]
+        # Data view
+        self._host_buffer_view = buf[meta_elems:meta_elems + data_elems].reshape(shape)
+        # Slot mapping view
+        sm_start = meta_elems + data_elems
+        self._slot_mapping_view = buf[sm_start:sm_start + sm_elems]
+        # Token counts view
+        tc_start = sm_start + sm_elems
+        self._token_counts_view = buf[tc_start:tc_start + tc_elems]
         if newly_created:
-            self._host_buffer_view.fill(0)
+            buf.fill(0)
 
         logger.debug(
             "Created shared memory buffer '%s' with shape %s compress_ratio=%s",
@@ -326,6 +348,9 @@ class RoutedExpertsReader:
         # Per EP-rank lists (index = dp_rank / ep_rank)
         self._shms: list[shared_memory.SharedMemory] = []
         self._host_buffer_views: list[np.ndarray] = []
+        self._metadata_views: list[np.ndarray] = []
+        self._slot_mapping_views: list[np.ndarray] = []
+        self._token_counts_views: list[np.ndarray] = []
         self._lock_files: list[str] = []
         self._dp_size: int = 1
 
@@ -380,6 +405,19 @@ class RoutedExpertsReader:
         self._dp_size = dp_size
         instance_id = vllm_config.instance_id
 
+        # Compute shared memory layout (same as worker side)
+        num_layers = hf_config.num_hidden_layers
+        num_experts_per_tok = hf_config.num_experts_per_tok
+        scheduler_config = vllm_config.scheduler_config
+        max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+        max_num_reqs = scheduler_config.max_num_seqs
+
+        data_elems = max_num_host_slots * num_layers * num_experts_per_tok
+        meta_elems = 2
+        sm_elems = max_num_batched_tokens
+        tc_elems = max_num_reqs
+        total_elems = meta_elems + data_elems + sm_elems + tc_elems
+
         for dp_rank in range(dp_size):
             lock_file = f"{_LOCK_FILE_PREFIX}_{instance_id}_{dp_rank}.lock"
             shm_name = f"{_BUFFER_PREFIX}_{instance_id}_{dp_rank}"
@@ -407,12 +445,23 @@ class RoutedExpertsReader:
                 )
                 continue
 
-            buf_view = np.ndarray(
-                shape, dtype=np.int32, buffer=shm.buf
-            )
+            buf = np.ndarray((total_elems,), dtype=np.int32, buffer=shm.buf)
+            # Metadata
+            meta_view = buf[:meta_elems]
+            # Data view
+            buf_view = buf[meta_elems:meta_elems + data_elems].reshape(shape)
+            # Slot mapping view
+            sm_start = meta_elems + data_elems
+            sm_view = buf[sm_start:sm_start + sm_elems]
+            # Token counts view
+            tc_start = sm_start + sm_elems
+            tc_view = buf[tc_start:tc_start + tc_elems]
 
             self._shms.append(shm)
             self._host_buffer_views.append(buf_view)
+            self._metadata_views.append(meta_view)
+            self._slot_mapping_views.append(sm_view)
+            self._token_counts_views.append(tc_view)
             self._lock_files.append(lock_file)
 
         logger.info(
@@ -443,6 +492,53 @@ class RoutedExpertsReader:
             "[routed_experts] read: indices[:3]=%s result_nonzero=%s",
             indices[:3], (result != 0).any(),
         )
+
+        return result
+
+    def get_routed_experts_by_request(
+        self, token_offset: int, token_count: int
+    ) -> np.ndarray:
+        """
+        Read routed expert data for a request using token-order indexing.
+
+        The worker writes the slot_mapping for all tokens in each step
+        into shared memory.  The scheduler uses token_offset and
+        token_count (derived from cumulative token counts) to find the
+        slot indices for a given request, then reads the data.
+
+        Args:
+            token_offset: Start index in the token-order slot_mapping.
+            token_count: Number of tokens for this request.
+
+        Returns:
+            Copy of the expert routing data for the given request.
+        """
+        if not self._host_buffer_views:
+            raise RuntimeError("Buffer not attached. Call attach_buffer() first.")
+        if not self._slot_mapping_views:
+            raise RuntimeError("Slot mapping not available in shared memory.")
+
+        sm_view = self._slot_mapping_views[0]
+        buf_view = self._host_buffer_views[0]
+        lock_file = self._lock_files[0]
+
+        with _file_lock(lock_file, mode="rb+"):
+            # Read slot indices for this request's tokens
+            slot_indices = sm_view[token_offset:token_offset + token_count].copy()
+
+        # Filter out -1 slots (tokens without KV cache slots)
+        valid_mask = slot_indices >= 0
+        valid_slots = slot_indices[valid_mask]
+
+        result = np.zeros(
+            (token_count, buf_view.shape[1], buf_view.shape[2]),
+            dtype=np.int32,
+        )
+
+        if len(valid_slots) > 0:
+            with _file_lock(lock_file, mode="rb+"):
+                valid_data = buf_view[valid_slots, :, :].copy()
+            result[valid_mask] = valid_data
 
         return result
 
