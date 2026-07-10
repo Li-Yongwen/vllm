@@ -168,7 +168,12 @@ class RoutedExpertsCapturer:
         )
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
 
-        if get_tensor_model_parallel_rank() != 0:
+        # All TP ranks need shared memory access in EP setups because each
+        # rank has a different slot_mapping (valid slots for its own tokens).
+        # Skip only for pure TP (no EP) where only TP0 needs to write.
+        from vllm.config import ParallelConfig
+        enable_ep = vllm_config.parallel_config.enable_expert_parallel
+        if not enable_ep and get_tensor_model_parallel_rank() != 0:
             return
 
         # Initialize shared memory
