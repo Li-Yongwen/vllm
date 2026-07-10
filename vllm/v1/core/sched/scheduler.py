@@ -1663,12 +1663,17 @@ class Scheduler(SchedulerInterface):
                     return result
 
         # Fallback: compute slot indices from block_ids
+        import sys
+        print(f"[FALLBACK] req={request.request_id} num_tokens={num_tokens} "
+              f"num_all_tokens={request.num_tokens}", file=sys.stderr, flush=True)
         kv_blocks = self.kv_cache_manager.get_blocks(request.request_id)
         block_ids = kv_blocks.get_block_ids()[self.routed_experts_attn_gid]
         block_ids_array = np.array(block_ids, dtype=np.int32)
         num_blocks = len(block_ids)
         attn_group = self.kv_cache_config.kv_cache_groups[self.routed_experts_attn_gid]
         block_size = attn_group.kv_cache_spec.block_size
+        print(f"[FALLBACK] num_blocks={num_blocks} block_ids[:3]={block_ids_array[:3].tolist()} "
+              f"block_size={block_size}", file=sys.stderr, flush=True)
 
         block_offsets = np.arange(0, block_size)
         slot_mapping = (
