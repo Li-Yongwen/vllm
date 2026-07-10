@@ -168,12 +168,7 @@ class RoutedExpertsCapturer:
         )
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
 
-        # In expert-parallel setups all EP ranks (each is also a TP rank)
-        # share the same dp_rank == 0 shared memory so that every rank
-        # can save its own token data.  When EP is disabled, only TP0
-        # creates the shared memory.
-        enable_ep = vllm_config.parallel_config.enable_expert_parallel
-        if not enable_ep and get_tensor_model_parallel_rank() != 0:
+        if get_tensor_model_parallel_rank() != 0:
             return
 
         # Initialize shared memory

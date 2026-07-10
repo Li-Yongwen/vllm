@@ -1617,10 +1617,6 @@ class Scheduler(SchedulerInterface):
         block_ids = kv_blocks.get_block_ids()[self.routed_experts_attn_gid]
         num_tokens = request.num_tokens - 1
 
-        import sys
-        print(f"[SCHED] req={request.request_id} num_tokens={num_tokens} "
-              f"block_ids[:3]={block_ids[:3]}", file=sys.stderr, flush=True)
-
         # compute slot mapping using attention group's block_size
         block_ids_array = np.array(block_ids, dtype=np.int32)
         num_blocks = len(block_ids)
