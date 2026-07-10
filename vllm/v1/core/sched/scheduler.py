@@ -1665,8 +1665,6 @@ class Scheduler(SchedulerInterface):
         # Fallback: compute slot indices from block_ids
         kv_blocks = self.kv_cache_manager.get_blocks(request.request_id)
         block_ids = kv_blocks.get_block_ids()[self.routed_experts_attn_gid]
-        import sys
-        print(f"[SCHED-BT] req_id={request.request_id} global_block_ids={block_ids[:5]}", file=sys.stderr, flush=True)
         block_ids_array = np.array(block_ids, dtype=np.int32)
         num_blocks = len(block_ids)
         attn_group = self.kv_cache_config.kv_cache_groups[self.routed_experts_attn_gid]
