@@ -69,8 +69,12 @@ def _file_lock(lock_file: str, mode: str = "wb+") -> Generator[None, None, None]
 
 def _create_or_attach_shared_memory(
     name: str, size: int, lock_file: str
-) -> shared_memory.SharedMemory:
-    """Create or attach to shared memory with proper locking."""
+) -> tuple[shared_memory.SharedMemory, bool]:
+    """Create or attach to shared memory with proper locking.
+
+    Returns:
+        Tuple of (SharedMemory instance, whether it was newly created).
+    """
     # Ensure lock file exists before acquiring lock
     with open(lock_file, "wb"):
         pass
@@ -78,6 +82,7 @@ def _create_or_attach_shared_memory(
     with _file_lock(lock_file):
         try:
             shm = shared_memory.SharedMemory(name=name, create=True, size=size)
+            return shm, True
         except FileExistsError:
             shm = shared_memory.SharedMemory(name=name, create=False, size=size)
 
@@ -91,11 +96,12 @@ def _create_or_attach_shared_memory(
             try:
                 shm = shared_memory.SharedMemory(name=name, create=True, size=size)
                 logger.info("Created shared memory %s", name)
+                return shm, True
             except FileExistsError:
                 shm = shared_memory.SharedMemory(name=name, create=False, size=size)
                 logger.info("Linked to existing shared memory %s", name)
 
-    return shm
+    return shm, False
 
 
 class RoutedExpertsCapturer:
@@ -162,7 +168,12 @@ class RoutedExpertsCapturer:
         )
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
 
-        if get_tensor_model_parallel_rank() != 0:
+        # In expert-parallel setups all EP ranks (each is also a TP rank)
+        # share the same dp_rank == 0 shared memory so that every rank
+        # can save its own token data.  When EP is disabled, only TP0
+        # creates the shared memory.
+        enable_ep = vllm_config.parallel_config.enable_expert_parallel
+        if not enable_ep and get_tensor_model_parallel_rank() != 0:
             return
 
         # Initialize shared memory
@@ -173,11 +184,12 @@ class RoutedExpertsCapturer:
         self._lock_file = f"{_LOCK_FILE_PREFIX}_{instance_id}_{self.dp_rank}.lock"
         shm_name = f"{_BUFFER_PREFIX}_{instance_id}_{self.dp_rank}"
 
-        self._shm = _create_or_attach_shared_memory(
+        self._shm, newly_created = _create_or_attach_shared_memory(
             shm_name, buffer_size, self._lock_file
         )
         self._host_buffer_view = np.ndarray(shape, dtype=np.int32, buffer=self._shm.buf)
-        self._host_buffer_view.fill(0)
+        if newly_created:
+            self._host_buffer_view.fill(0)
 
         logger.debug(
             "Created shared memory buffer '%s' with shape %s compress_ratio=%s",
@@ -247,10 +259,8 @@ class RoutedExpertsCapturer:
                 Required when compress_ratio > 1 to expand indices to
                 per-token granularity.
         """
-        if get_tensor_model_parallel_rank() != 0:
-            return
         if self._lock_file is None:
-            raise RuntimeError("Shared memory not initialized.")
+            return
         if self._host_buffer_view is None:
             return
         if self._device_buffer is None:
