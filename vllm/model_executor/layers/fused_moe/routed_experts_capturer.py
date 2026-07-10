@@ -168,12 +168,7 @@ class RoutedExpertsCapturer:
         )
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
 
-        # All TP ranks need shared memory access in EP setups because each
-        # rank has a different slot_mapping (valid slots for its own tokens).
-        # Skip only for pure TP (no EP) where only TP0 needs to write.
-        from vllm.config import ParallelConfig
-        enable_ep = vllm_config.parallel_config.enable_expert_parallel
-        if not enable_ep and get_tensor_model_parallel_rank() != 0:
+        if get_tensor_model_parallel_rank() != 0:
             return
 
         # Initialize shared memory
@@ -430,12 +425,8 @@ class RoutedExpertsReader:
         """
         Read routed expert data from shared memory.
 
-        In EP setups, reads from all EP ranks' buffers and merges them
-        so that each token gets the routing data from whichever rank
-        wrote to its slot.
-
         Args:
-            indices: Array of indices to read.
+            indices: Array of KV-slot indices to read.
 
         Returns:
             Copy of the expert routing data for the given indices.
@@ -443,31 +434,14 @@ class RoutedExpertsReader:
         if not self._host_buffer_views:
             raise RuntimeError("Buffer not attached. Call attach_buffer() first.")
 
-        # Read from all EP rank buffers and merge.
-        # Each EP rank writes to its own slot positions; zeros indicate
-        # "no data at this slot from this rank".  We merge by picking
-        # the first non-zero entry across ranks.
-        result: np.ndarray | None = None
-        for dp_rank, (buf_view, lock_file) in enumerate(
-            zip(self._host_buffer_views, self._lock_files)
-        ):
-            with _file_lock(lock_file, mode="rb+"):
-                chunk = buf_view[indices, :, :].copy()
-            if dp_rank == 0:
-                result = chunk
-            else:
-                # Merge: where result is zero, take chunk's value.
-                zero_mask = result == 0
-                result[zero_mask] = chunk[zero_mask]
-
-        assert result is not None
+        buf_view = self._host_buffer_views[0]
+        lock_file = self._lock_files[0]
+        with _file_lock(lock_file, mode="rb+"):
+            result = buf_view[indices, :, :].copy()
 
         logger.debug(
-            "[routed_experts] read: indices[:3]=%s result_nonzero=%s "
-            "host_buf_shape=%s dp_size=%s",
+            "[routed_experts] read: indices[:3]=%s result_nonzero=%s",
             indices[:3], (result != 0).any(),
-            self._host_buffer_views[0].shape if self._host_buffer_views else None,
-            self._dp_size,
         )
 
         return result

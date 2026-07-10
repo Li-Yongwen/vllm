@@ -1624,8 +1624,7 @@ class Scheduler(SchedulerInterface):
         block_size = attn_group.kv_cache_spec.block_size
 
         # Use the same slot indexing that the worker writes to shared memory.
-        # The worker uses slot_mapping from the block table which is:
-        #   block_id * block_size + offset_within_block
+        # The worker computes: slot = block_id * block_size + offset_within_block
         block_offsets = np.arange(0, block_size)
         slot_mapping = (
             block_offsets.reshape((1, block_size))
