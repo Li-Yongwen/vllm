@@ -1631,6 +1631,11 @@ class Scheduler(SchedulerInterface):
         num_blocks = len(block_ids)
         attn_group = self.kv_cache_config.kv_cache_groups[self.routed_experts_attn_gid]
         block_size = attn_group.kv_cache_spec.block_size
+        import sys
+        print(f"[S-SLOT] req={request.request_id} num_tokens={num_tokens} "
+              f"block_size={block_size} num_blocks={num_blocks} "
+              f"block_ids[:3]={block_ids_array[:3].tolist()}",
+              file=sys.stderr, flush=True)
 
         block_offsets = np.arange(0, block_size)
         slot_mapping = (
