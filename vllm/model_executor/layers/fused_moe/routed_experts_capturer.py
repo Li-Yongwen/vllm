@@ -169,10 +169,8 @@ class RoutedExpertsCapturer:
         )
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
 
-        if get_tensor_model_parallel_rank() != 0:
-            return
-
-        # Initialize shared memory
+        # Initialize shared memory for all TP/EP ranks so each rank
+        # can write its portion of routed-experts data.
         max_num_host_slots = max_num_kv_tokens * compress_ratio
         shape = (max_num_host_slots, num_layers, num_experts_per_tok)
         # Shared memory layout:
