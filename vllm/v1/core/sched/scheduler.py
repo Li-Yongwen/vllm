@@ -1643,7 +1643,13 @@ class Scheduler(SchedulerInterface):
             + block_ids_array.reshape((num_blocks, 1)) * block_size
         ).flatten()[:num_tokens]
 
-        return reader.get_routed_experts(indices=slot_mapping)
+        result = reader.get_routed_experts(indices=slot_mapping)
+        nonzero_count = int(np.any(result != 0, axis=(1, 2)).sum())
+        print(f"[S-READ] req={request.request_id} slot_range=[{slot_mapping[0]},{slot_mapping[-1]}] "
+              f"nonzero_tokens={nonzero_count}/{num_tokens} "
+              f"result[:2]={result[:2].tolist()}",
+              file=sys.stderr, flush=True)
+        return result
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]
